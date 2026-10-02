@@ -12,10 +12,18 @@ PYTHONPATH=src python3 -m mappilot.server --host 127.0.0.1 --port 8080
 
 服务默认监听 `127.0.0.1:8080`，可通过 `MAPPILOT_ADDR` 修改。`GET /healthz` 返回 JSON 健康状态。
 
+## 位姿表示
+
+`mappilot.geometry.Pose3` 提供右手坐标系下的 SE(3) 刚体位姿（局部坐标 → 父坐标），平移按 `(x, y, z)`、四元数按 `(w, x, y, z)` 排列。支持从平移加四元数或 4×4 齐次矩阵创建，提供复合、求逆、单点与点序列变换，以及六维切向量 `(wx, wy, wz, vx, vy, vz)` 下的 `exp`/`log` 映射（左扰动约定）。该模块为纯 Python 实现，无需启动 HTTP 服务：
+
+```bash
+PYTHONPATH=src python3 -c "from mappilot.geometry import Pose3; print(Pose3.exp((0, 0, 1, 1, 2, 3)).log())"
+```
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前基线刻意不包含位姿运算、扫描匹配与位姿图优化的实现，以便后续任务从已冻结事实出发独立设计并验证这些能力。
+扫描匹配与位姿图优化等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
