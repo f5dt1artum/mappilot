@@ -126,10 +126,34 @@ closure.correspondences  # (早帧点索引, 晚帧点索引)，按早帧索引�
 
 返回值及其元素均不可变，结果按早帧、晚帧的输入位置升序排列；空输入返回空元组，生成器只被消费一次，输入对象不被修改。`relative_pose` 采用 `T_early.inverse().compose(T_late)` 的位姿图约定，等于 ICP 所得早帧到晚帧扫描变换之逆。关键帧或点云不可迭代、记录形状错误、ID 类型错误、位姿不是 `Pose3`、坐标维度错误或坐标不是非布尔实数时抛出 `TypeError`；ID 重复、点云少于三个点、坐标含非有限值或控制参数越界时抛出 `ValueError`。该模块仅依赖标准库与 `mappilot.geometry`、`mappilot.registration`，导入时不会启动 HTTP 服务。
 
+## 地图表示
+
+`mappilot.mapping.build_occupancy_grid` 把按时间排列的激光帧构建为确定性的二维占据栅格。每帧为 `(id, pose, points)`：唯一非布尔整数 ID、传感器世界系 `Pose3`、该帧局部坐标系中至少一个有限实数三维点。构图先用每帧位姿把点变换到世界系，再投影到 x-y 平面（忽略 z），然后以传感器格为起点、命中格为终点执行标准二维 Bresenham 遍历：终点之前的格记为空闲，终点格记为占据；同一格冲突时占据优先于空闲，未被射线覆盖的格保持未知。
+
+栅格边界是包含所有传感器原点及有效射线终点的最小分辨率对齐矩形，四边增加 `padding` 后向外对齐；`origin` 为左下角外边界，世界坐标 `p` 到格索引使用 `floor((p - origin) / resolution)`，因此恰好落在网格线上的终点由该线之后的格覆盖。`max_range` 为 `None` 时保留全部命中；设置后水平距离严格超过该值的射线截断到量程边界，截断终点（及其射线）只记空闲、不产生占据；水平距离为零的有效点直接把所在格记为占据。
+
+```python
+from mappilot.mapping import build_occupancy_grid
+
+grid = build_occupancy_grid(
+    scans,              # (整数 ID, Pose3, 局部三维点) 按时间排列，每帧至少一个点
+    resolution=0.05,    # 正有限实数
+    padding=0.0,        # 非负有限实数，四边外扩后向外对齐
+    max_range=None,     # None 或正有限实数；超出的射线截断为空闲
+)
+grid.resolution  # 浮点分辨率
+grid.origin      # 左下角外边界 (x, y)
+grid.width       # 列数
+grid.height      # 行数
+grid.data        # 一维元组，按 y 递增、每行 x 递增；-1/0/100 = 未知/空闲/占据
+```
+
+`OccupancyGrid2D` 不可变，格 `(ix, iy)` 的索引为 `iy * width + ix`。输入帧或点的顺序变化不改变相同观测集合的结果；`scans` 及点云生成器只被消费一次且输入不被修改，空 `scans` 或空点云会被拒绝。`scans` 或点云不可迭代、帧形状错误、ID 不是非布尔整数、位姿不是 `Pose3`、点维度错误、坐标或参数不是非布尔实数时抛出 `TypeError`；重复 ID、坐标非有限、空帧或空点云、`resolution` 非正或非有限、`padding` 为负或非有限、`max_range` 非正或非有限时抛出 `ValueError`。该模块仅依赖标准库与 `mappilot.geometry`，导入时不会启动 HTTP 服务。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-多传感器融合、重定位和地图表示等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
+多传感器融合、重定位等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
