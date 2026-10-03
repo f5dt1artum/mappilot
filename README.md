@@ -99,10 +99,37 @@ result.final_error   # 从返回位姿重新计算的总误差
 
 输入不可迭代、节点 ID 不是非布尔整数、位姿或测量不是 `Pose3`、约束或信息矩阵形状错误、矩阵元素不是非布尔实数，以及 `max_iterations` 或 `tolerance` 类型错误时抛出 `TypeError`；节点为空或 ID 重复、约束引用未知节点、固定节点未知、固定集合为空、存在未固定的连通分量、矩阵含非有限值、以 1e-12 绝对容差判断不对称或不是正定矩阵，以及 `max_iterations` 非正或 `tolerance` 非正、非有限时抛出 `ValueError`。该模块仅依赖标准库与 `mappilot.geometry`，导入时不会启动 HTTP 服务。
 
+## 闭环检测
+
+`mappilot.loop_closure.detect_loop_closures` 在按时间排列的关键帧序列中发现并几何验证闭环。每个关键帧为 `(id, pose, points)`：唯一非布尔整数 ID、世界系 `Pose3` 初值、该帧局部坐标系中至少三个有限实数三维点。仅检查输入位置差不小于 `min_separation` 的早帧-晚帧对；位姿原点距离超过 `translation_threshold` 或相对旋转最小测地角超过 `rotation_threshold` 的配对在几何验证前被跳过。其余配对以两个位姿初值推导早帧点云到晚帧点云的初始变换 `T_late^{-1}·T_early`，再按 `point_to_point_icp` 的既有规则细化；只有 ICP 收敛、最终有效配对数不少于 `min_correspondences` 且 RMSE 不大于 `max_rmse` 时才接受。配对不足、几何退化或迭代耗尽只拒绝该候选，不影响其他配对。
+
+```python
+from mappilot.loop_closure import detect_loop_closures
+
+closures = detect_loop_closures(
+    keyframes,            # (整数 ID, Pose3, 局部点云) 按时间排列
+    min_separation=10,    # 最小帧序间隔，正整数
+    translation_threshold=10.0,   # 平移预筛阈值，非负有限实数
+    rotation_threshold=1.5707963267948966,  # 旋转预筛阈值，[0, pi]
+    min_correspondences=3,        # 最少配对数，不小于三
+    max_rmse=0.5,                 # 最大验收 RMSE，非负有限实数
+    max_iterations=50,            # 以下三项沿用 point_to_point_icp 语义
+    tolerance=1e-6,
+    max_correspondence_distance=None,
+)
+closure.early_id         # 早帧 ID
+closure.late_id          # 晚帧 ID
+closure.relative_pose    # 相对 Pose3，可直接作为 optimize_pose_graph 边的 measurement
+closure.rmse             # 最终 RMSE
+closure.correspondences  # (早帧点索引, 晚帧点索引)，按早帧索引升序
+```
+
+返回值及其元素均不可变，结果按早帧、晚帧的输入位置升序排列；空输入返回空元组，生成器只被消费一次，输入对象不被修改。`relative_pose` 采用 `T_early.inverse().compose(T_late)` 的位姿图约定，等于 ICP 所得早帧到晚帧扫描变换之逆。关键帧或点云不可迭代、记录形状错误、ID 类型错误、位姿不是 `Pose3`、坐标维度错误或坐标不是非布尔实数时抛出 `TypeError`；ID 重复、点云少于三个点、坐标含非有限值或控制参数越界时抛出 `ValueError`。该模块仅依赖标准库与 `mappilot.geometry`、`mappilot.registration`，导入时不会启动 HTTP 服务。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-闭环检测等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
+多传感器融合、重定位和地图表示等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
