@@ -1,8 +1,9 @@
-"""Point-to-point ICP scan registration.
+"""Point-to-point and point-to-plane ICP scan registration.
 
-The :func:`point_to_point_icp` entry point estimates the rigid :class:`~mappilot.geometry.Pose3`
-that aligns a source point cloud onto a target point cloud using the classic
-iterative closest point loop:
+The :func:`point_to_point_icp` and :func:`point_to_plane_icp` entry points
+estimate the rigid :class:`~mappilot.geometry.Pose3` that aligns a source
+point cloud onto a target point cloud using the classic iterative closest
+point loop:
 
 1. Transform the source points with the current pose.
 2. Match every transformed source point to its nearest target point (targets
@@ -11,7 +12,10 @@ iterative closest point loop:
    the gate are dropped.
 3. Solve the rigid transform minimizing the sum of squared pair distances
    (SVD of the centered cross-covariance), enforcing determinant +1 so the
-   rotation can never contain a reflection.
+   rotation can never contain a reflection. Point-to-plane instead solves
+   the linearized least-squares system for the 6-DoF tangent increment that
+   minimizes the squared signed projection of each pair's offset onto the
+   target normal, and applies it through :meth:`Pose3.exp`.
 4. Stop once the absolute RMSE change between two rounds is within tolerance.
 
 This module is pure Python and depends only on the standard library plus
@@ -20,11 +24,12 @@ This module is pure Python and depends only on the standard library plus
 Validation policy mirrors :mod:`mappilot.geometry`: non-real scalars
 (including booleans), non-iterable clouds, wrong point dimensions, and
 parameters of the wrong type raise :class:`TypeError`; NaN or infinite
-coordinates or parameter values, clouds with fewer than three points,
-non-positive iteration limits/tolerances/gates, fewer than three valid
-correspondences, and correspondence configurations that cannot uniquely
-constrain a 3D rigid pose (collinear point sets and the like) raise
-:class:`ValueError`.
+coordinates or parameter values, clouds with too few points (three for
+point-to-point, six for point-to-plane), target-normal count mismatches,
+zero-length normals, non-positive iteration limits/tolerances/gates, too
+few valid correspondences, and correspondence configurations that cannot
+uniquely constrain the 3D rigid pose (collinear point sets, parallel
+normal fields, and the like) raise :class:`ValueError`.
 """
 
 from __future__ import annotations
@@ -35,7 +40,12 @@ from typing import Iterable, NamedTuple
 
 from .geometry import Pose3
 
-__all__ = ["ICPResult", "point_to_point_icp"]
+__all__ = [
+    "ICPResult",
+    "PointToPlaneICPResult",
+    "point_to_plane_icp",
+    "point_to_point_icp",
+]
 
 # Machine epsilon used by the Jacobi SVD and the rank-deficiency test.
 _EPS = 2.220446049250313e-16
@@ -62,6 +72,23 @@ class ICPResult(NamedTuple):
     correspondences: tuple[tuple[int, int], ...]
 
 
+class PointToPlaneICPResult(NamedTuple):
+    """Outcome of :func:`point_to_plane_icp`.
+
+    Immutable. ``correspondences`` holds ``(source_index, target_index)``
+    pairs ordered by ascending source index, recomputed from nearest
+    neighbours under the returned ``pose``; ``rmse`` is the root mean
+    squared signed projection error of exactly those pairs onto their
+    target normals, so the two always agree.
+    """
+
+    pose: Pose3
+    converged: bool
+    iterations: int
+    rmse: float
+    correspondences: tuple[tuple[int, int], ...]
+
+
 # -- validation -------------------------------------------------------------
 
 
@@ -75,16 +102,20 @@ def _real_scalar(value: object, name: str) -> float:
     return result
 
 
-def _point_cloud(value: object, name: str) -> tuple[tuple[float, float, float], ...]:
-    """Validate a cloud of at least three 3D finite points."""
+def _point_cloud(
+    value: object, name: str, minimum: int = 3
+) -> tuple[tuple[float, float, float], ...]:
+    """Validate a cloud of at least ``minimum`` 3D finite points."""
     if isinstance(value, (str, bytes, bytearray)):
         raise TypeError(f"{name} must be an iterable of 3D points")
     try:
         raw_points = list(value)  # type: ignore[call-overload]
     except TypeError:
         raise TypeError(f"{name} must be an iterable of 3D points") from None
-    if len(raw_points) < 3:
-        raise ValueError(f"{name} must contain at least 3 points, got {len(raw_points)}")
+    if len(raw_points) < minimum:
+        raise ValueError(
+            f"{name} must contain at least {minimum} points, got {len(raw_points)}"
+        )
 
     points: list[tuple[float, float, float]] = []
     for index, raw_point in enumerate(raw_points):
@@ -122,6 +153,55 @@ def _positive_float(value: object, name: str) -> float:
     if result <= 0.0:
         raise ValueError(f"{name} must be greater than zero, got {result}")
     return result
+
+
+def _normal_field(
+    value: object, name: str, expected_count: int
+) -> tuple[tuple[float, float, float], ...]:
+    """Validate one finite, non-zero 3D normal per target point, normalized.
+
+    Each normal is divided by its own Euclidean length, so scaling any
+    normal by a positive factor never changes the result.
+    """
+    if isinstance(value, (str, bytes, bytearray)):
+        raise TypeError(f"{name} must be an iterable of 3D vectors")
+    try:
+        raw_normals = list(value)  # type: ignore[call-overload]
+    except TypeError:
+        raise TypeError(f"{name} must be an iterable of 3D vectors") from None
+    if len(raw_normals) != expected_count:
+        raise ValueError(
+            f"{name} must contain one normal per target point, got "
+            f"{len(raw_normals)} for {expected_count} target points"
+        )
+
+    normals: list[tuple[float, float, float]] = []
+    for index, raw_normal in enumerate(raw_normals):
+        if isinstance(raw_normal, (str, bytes, bytearray)):
+            raise TypeError(f"{name}[{index}] must be a sequence of 3 real numbers")
+        try:
+            raw_coords = list(raw_normal)  # type: ignore[call-overload]
+        except TypeError:
+            raise TypeError(
+                f"{name}[{index}] must be a sequence of 3 real numbers"
+            ) from None
+        if len(raw_coords) != 3:
+            raise TypeError(
+                f"{name}[{index}] must have 3 components, got {len(raw_coords)}"
+            )
+        normal = tuple(
+            _real_scalar(coord, f"{name}[{index}][{coord_index}]")
+            for coord_index, coord in enumerate(raw_coords)
+        )
+        length = math.sqrt(
+            normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]
+        )
+        if length == 0.0:
+            raise ValueError(f"{name}[{index}] must have non-zero length")
+        normals.append(
+            (normal[0] / length, normal[1] / length, normal[2] / length)
+        )
+    return tuple(normals)
 
 
 # -- nearest neighbours -----------------------------------------------------
@@ -344,7 +424,128 @@ def _solve_rigid(
     )
 
 
-# -- public entry point -----------------------------------------------------
+# -- point-to-plane solve ---------------------------------------------------
+
+
+def _projection_residual(
+    moved: tuple[float, float, float],
+    point: tuple[float, float, float],
+    normal: tuple[float, float, float],
+) -> float:
+    """Signed projection of ``moved - point`` onto the target ``normal``."""
+    return (
+        normal[0] * (moved[0] - point[0])
+        + normal[1] * (moved[1] - point[1])
+        + normal[2] * (moved[2] - point[2])
+    )
+
+
+def _projection_rmse(
+    moved: tuple[tuple[float, float, float], ...],
+    target: tuple[tuple[float, float, float], ...],
+    normals: tuple[tuple[float, float, float], ...],
+    pairs: list[tuple[int, int, float]],
+) -> float:
+    total = 0.0
+    for source_index, target_index, _ in pairs:
+        residual = _projection_residual(
+            moved[source_index], target[target_index], normals[target_index]
+        )
+        total += residual * residual
+    return math.sqrt(total / len(pairs))
+
+
+def _solve_linear6(matrix: list[list[float]], rhs: list[float]) -> list[float]:
+    """Solve a 6x6 system by Gaussian elimination with partial pivoting.
+
+    Raises :class:`ValueError` when the normal constraints cannot uniquely
+    determine the 6-DoF pose increment (the system is singular to within
+    floating-point noise). Pivoting is deterministic, so identical inputs
+    always produce identical increments.
+    """
+    size = 6
+    augmented = [row[:] + [rhs[index]] for index, row in enumerate(matrix)]
+    scale = 0.0
+    for row in augmented:
+        for value in row[:size]:
+            if abs(value) > scale:
+                scale = abs(value)
+    if scale == 0.0:
+        raise ValueError(
+            "target-normal constraints cannot uniquely determine the "
+            "6-DoF pose increment"
+        )
+    # A singular system leaves pivots at the O(eps * scale) noise floor.
+    singular_tolerance = scale * 64.0 * _EPS
+
+    for col in range(size):
+        pivot = col
+        for candidate in range(col + 1, size):
+            if abs(augmented[candidate][col]) > abs(augmented[pivot][col]):
+                pivot = candidate
+        if abs(augmented[pivot][col]) <= singular_tolerance:
+            raise ValueError(
+                "target-normal constraints cannot uniquely determine the "
+                "6-DoF pose increment"
+            )
+        if pivot != col:
+            augmented[col], augmented[pivot] = augmented[pivot], augmented[col]
+        pivot_value = augmented[col][col]
+        for row in range(col + 1, size):
+            factor = augmented[row][col] / pivot_value
+            if factor == 0.0:
+                continue
+            augmented[row][col] = 0.0
+            for k in range(col + 1, size + 1):
+                augmented[row][k] -= factor * augmented[col][k]
+
+    result = [0.0] * size
+    for row in range(size - 1, -1, -1):
+        total = augmented[row][size]
+        for k in range(row + 1, size):
+            total -= augmented[row][k] * result[k]
+        result[row] = total / augmented[row][row]
+    return result
+
+
+def _solve_point_to_plane(
+    moved: tuple[tuple[float, float, float], ...],
+    target: tuple[tuple[float, float, float], ...],
+    normals: tuple[tuple[float, float, float], ...],
+    pairs: list[tuple[int, int, float]],
+) -> Pose3:
+    """Tangent increment minimizing squared signed projection errors.
+
+    Linearizes the residual ``n . (R p + t - q)`` of each pair around the
+    current pose with the left-perturbation model ``p -> p + w x p + v``
+    and solves the 6x6 normal equations for ``(w, v)``; the returned pose
+    is :meth:`Pose3.exp` of that increment, to be composed on the left.
+    """
+    normal_matrix = [[0.0] * 6 for _ in range(6)]
+    normal_rhs = [0.0] * 6
+    for source_index, target_index, _ in pairs:
+        source = moved[source_index]
+        point = target[target_index]
+        normal = normals[target_index]
+        # Row of the Jacobian: (p x n, n) against (w, v).
+        cross = (
+            source[1] * normal[2] - source[2] * normal[1],
+            source[2] * normal[0] - source[0] * normal[2],
+            source[0] * normal[1] - source[1] * normal[0],
+        )
+        row = (cross[0], cross[1], cross[2], normal[0], normal[1], normal[2])
+        residual = _projection_residual(source, point, normal)
+        for i in range(6):
+            row_i = row[i]
+            normal_rhs[i] -= row_i * residual
+            matrix_row = normal_matrix[i]
+            for j in range(6):
+                matrix_row[j] += row_i * row[j]
+    increment = _solve_linear6(normal_matrix, normal_rhs)
+    return Pose3.exp(tuple(increment))
+
+
+# -- public entry points ----------------------------------------------------
 
 
 def point_to_point_icp(
@@ -440,3 +641,113 @@ def point_to_point_icp(
     )
     final_rmse = _rmse_of(final_pairs)
     return ICPResult(pose, converged, updates, final_rmse, correspondences)
+
+
+def point_to_plane_icp(
+    source_points: Iterable[Iterable[float]],
+    target_points: Iterable[Iterable[float]],
+    target_normals: Iterable[Iterable[float]],
+    initial_pose: Pose3 | None = None,
+    max_iterations: int = 50,
+    tolerance: float = 1e-6,
+    max_correspondence_distance: float | None = None,
+) -> PointToPlaneICPResult:
+    """Align ``source_points`` onto ``target_points`` with point-to-plane ICP.
+
+    Parameters
+    ----------
+    source_points, target_points:
+        Iterables of at least six ``(x, y, z)`` points each. Coordinates
+        must be finite real numbers (booleans rejected).
+    target_normals:
+        One finite, non-zero ``(nx, ny, nz)`` normal per target point.
+        Each normal is normalized by its own length before use, so scaling
+        a normal by a positive factor never changes the result.
+    initial_pose:
+        Pose applied to the source before the first round; defaults to identity.
+    max_iterations:
+        Maximum number of pose updates; a positive integer, default 50.
+    tolerance:
+        Convergence threshold on the absolute RMSE change between consecutive
+        rounds; a finite positive number, default 1e-6.
+    max_correspondence_distance:
+        When given (finite positive), pairs farther apart than this are
+        discarded; ``None`` (default) keeps every nearest pair regardless of
+        distance.
+
+    Returns
+    -------
+    PointToPlaneICPResult
+        Never raises on non-convergence: exhausting ``max_iterations``
+        returns the last pose with ``converged=False``. The reported
+        correspondences and RMSE are recomputed from nearest neighbours
+        under the returned pose, with correspondences ordered by ascending
+        source index; ``rmse`` is the root mean squared signed projection
+        error of those pairs onto their target normals.
+
+    Raises
+    ------
+    ValueError
+        If fewer than six valid correspondences remain, or the target
+        normals cannot uniquely constrain the 6-DoF pose increment (for
+        example a planar patch with a parallel normal field).
+    """
+    source = _point_cloud(source_points, "source_points", minimum=6)
+    target = _point_cloud(target_points, "target_points", minimum=6)
+    normals = _normal_field(target_normals, "target_normals", len(target))
+    if initial_pose is None:
+        pose = Pose3.identity()
+    elif isinstance(initial_pose, Pose3):
+        pose = initial_pose
+    else:
+        raise TypeError(
+            f"initial_pose must be a Pose3, got {type(initial_pose).__name__}"
+        )
+    iteration_limit = _positive_int(max_iterations, "max_iterations")
+    convergence_tolerance = _positive_float(tolerance, "tolerance")
+    gate = max_correspondence_distance
+    if gate is not None:
+        gate_squared: float | None = _positive_float(
+            gate, "max_correspondence_distance"
+        ) ** 2
+    else:
+        gate_squared = None
+
+    updates = 0
+    previous_rmse: float | None = None
+    converged = False
+
+    for _ in range(iteration_limit):
+        moved = pose.transform_points(source)
+        pairs = _match(moved, target, gate_squared)
+        if len(pairs) < 6:
+            raise ValueError(
+                "point-to-plane ICP requires at least six valid "
+                f"correspondences, got {len(pairs)}"
+            )
+        round_rmse = _projection_rmse(moved, target, normals, pairs)
+        if (
+            previous_rmse is not None
+            and abs(round_rmse - previous_rmse) <= convergence_tolerance
+        ):
+            converged = True
+            break
+        delta = _solve_point_to_plane(moved, target, normals, pairs)
+        pose = delta.compose(pose)
+        updates += 1
+        previous_rmse = round_rmse
+
+    # Recompute the reported pairs and RMSE from the final pose so they can
+    # never describe a stale intermediate alignment.
+    final_moved = pose.transform_points(source)
+    final_pairs = _match(final_moved, target, gate_squared)
+    if len(final_pairs) < 6:
+        raise ValueError(
+            "point-to-plane ICP requires at least six valid "
+            f"correspondences, got {len(final_pairs)}"
+        )
+    correspondences = tuple(
+        (source_index, target_index) for source_index, target_index, _ in final_pairs
+    )
+    final_rmse = _projection_rmse(final_moved, target, normals, final_pairs)
+    return PointToPlaneICPResult(pose, converged, updates, final_rmse, correspondences)
