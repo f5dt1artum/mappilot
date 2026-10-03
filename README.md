@@ -67,10 +67,42 @@ result.correspondences # (源点索引, 目标点索引)，按源点索引升序
 
 `PointToPlaneICPResult` 同样不可变，`correspondences` 与 `rmse` 基于返回位姿重新计算。源点、目标点少于六个，法向量数量与目标点不符或长度为零，有效配对少于六个，以及法向约束不能唯一确定六自由度位姿增量（如法向全部平行的平面）时抛出 `ValueError`；类型错误的异常语义与点到点 ICP 相同。
 
+## 位姿图优化
+
+`mappilot.pose_graph.optimize_pose_graph` 以节点初值和相对位姿约束生成全局一致轨迹。节点为有序且 ID 唯一的 `(id, pose)` 序列，`id` 为非布尔整数，`pose` 为节点的 `Pose3` 初值；约束为 `(from_id, to_id, measurement, information)` 序列，其中 `measurement` 是从 `from` 节点到 `to` 节点的测量相对位姿，`information` 是按 `Pose3.log` 六个分量排列的对称正定 6×6 信息矩阵（不对称判断绝对容差 1e-12）。每条约束的残差与总误差为
+
+```
+e = log( z^{-1} · T_i^{-1} · T_j )
+E = Σ eᵀ Ω e
+```
+
+优化采用左扰动约定（`T ← exp(dx)·T`）下的高斯-牛顿迭代，残差雅可比为 `J_to = J_l(e)^{-1}·Ad_{z^{-1}T_i^{-1}}`、`J_from = −J_to`，固定节点的行列从法方程中消去后整体求解并同时更新所有自由节点。`fixed_node_ids` 不得为空，且每个（无向图）连通分量至少有一个固定节点；固定节点的位姿逐值不变。
+
+```python
+from mappilot.pose_graph import optimize_pose_graph
+
+result = optimize_pose_graph(
+    nodes,             # (整数 ID, Pose3) 有序序列，ID 唯一
+    constraints,       # (起点 ID, 终点 ID, measurement Pose3, 6x6 information)
+    fixed_node_ids,    # 非空；每个连通分量至少一个
+    max_iterations=50, # 高斯-牛顿更新次数上限，正整数
+    tolerance=1e-6,    # 相邻两次更新总误差绝对差收敛阈值，正有限实数
+)
+result.nodes         # (ID, Pose3) 元组，按输入顺序排列
+result.converged     # 是否收敛
+result.iterations    # 实际完成的高斯-牛顿更新次数
+result.initial_error # 从初始位姿重新计算的总误差
+result.final_error   # 从返回位姿重新计算的总误差
+```
+
+`PoseGraphResult` 不可变。初始总误差不大于 `tolerance` 时直接返回 `converged=True`、`iterations=0` 且位姿不变；否则相邻两次更新的总误差绝对差不大于 `tolerance` 时收敛，用尽 `max_iterations` 不抛异常，返回最后结果并令 `converged=False`。`initial_error` 与 `final_error` 均从对应位姿重新计算，与 `nodes` 始终一致。
+
+输入不可迭代、节点 ID 不是非布尔整数、位姿或测量不是 `Pose3`、约束或信息矩阵形状错误、矩阵元素不是非布尔实数，以及 `max_iterations` 或 `tolerance` 类型错误时抛出 `TypeError`；节点为空或 ID 重复、约束引用未知节点、固定节点未知、固定集合为空、存在未固定的连通分量、矩阵含非有限值、以 1e-12 绝对容差判断不对称或不是正定矩阵，以及 `max_iterations` 非正或 `tolerance` 非正、非有限时抛出 `ValueError`。该模块仅依赖标准库与 `mappilot.geometry`，导入时不会启动 HTTP 服务。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-位姿图优化、闭环检测等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
+闭环检测等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
