@@ -44,6 +44,29 @@ result.correspondences # (源点索引, 目标点索引)，按源点索引升序
 
 `ICPResult` 不可变；`correspondences` 与 `rmse` 都基于返回位姿重新计算，二者始终一致。两个点云都必须至少包含三个有限实数的三维点；有效配对少于三个或配对点共线等无法唯一约束三维刚体位姿时抛出 `ValueError`，点云不可迭代、点维度错误、坐标非实数或为布尔值、`initial_pose` 不是 `Pose3`、参数类型错误时抛出 `TypeError`。该模块仅依赖标准库，导入时不会启动 HTTP 服务。
 
+`mappilot.registration.point_to_plane_icp` 在同样的最近点配对循环上引入目标表面法向约束：额外接收与目标点一一对应的法向量（计算前按自身长度归一化，正比例缩放不改变结果），每轮求解使变换后源点到对应目标切平面有符号投影误差平方和最小的六自由度位姿增量（线性化后经 `Pose3.exp` 左乘更新）。`initial_pose`、`max_iterations`、`tolerance`、`max_correspondence_distance` 语义与点到点 ICP 一致。
+
+```python
+from mappilot.registration import point_to_plane_icp
+
+result = point_to_plane_icp(
+    source_points,          # 至少六个三维点
+    target_points,          # 至少六个三维点
+    target_normals,         # 与目标点一一对应的非零有限法向量
+    initial_pose=None,
+    max_iterations=50,
+    tolerance=1e-6,
+    max_correspondence_distance=None,
+)
+result.pose            # 估计的 Pose3
+result.converged       # 是否在迭代上限内收敛
+result.iterations      # 实际完成的位姿更新次数
+result.rmse            # 最终配对在目标切平面上的有符号投影误差均方根
+result.correspondences # (源点索引, 目标点索引)，按源点索引升序
+```
+
+`PointToPlaneICPResult` 同样不可变，`correspondences` 与 `rmse` 基于返回位姿重新计算。源点、目标点少于六个，法向量数量与目标点不符或长度为零，有效配对少于六个，以及法向约束不能唯一确定六自由度位姿增量（如法向全部平行的平面）时抛出 `ValueError`；类型错误的异常语义与点到点 ICP 相同。
+
 ## 验证
 
 ```bash

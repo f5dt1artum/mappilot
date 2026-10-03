@@ -2,7 +2,12 @@ import math
 import unittest
 
 from mappilot.geometry import Pose3
-from mappilot.registration import ICPResult, point_to_point_icp
+from mappilot.registration import (
+    ICPResult,
+    PointToPlaneICPResult,
+    point_to_plane_icp,
+    point_to_point_icp,
+)
 
 
 def rotation_z(angle):
@@ -377,6 +382,231 @@ class ValidationTest(unittest.TestCase):
         point_to_point_icp(
             self.GOOD, self.GOOD, max_correspondence_distance=10
         )
+
+
+def bumpy_surface():
+    """Sixteen points on z = f(x, y) with exact (unnormalized) normals."""
+
+    def f(x, y):
+        return 0.3 * math.sin(1.7 * x) * math.cos(1.3 * y) + 0.1 * x * y
+
+    def normal(x, y):
+        dfx = 0.3 * 1.7 * math.cos(1.7 * x) * math.cos(1.3 * y) + 0.1 * y
+        dfy = -0.3 * 1.3 * math.sin(1.7 * x) * math.sin(1.3 * y) + 0.1 * x
+        return (-dfx, -dfy, 1.0)
+
+    points = [
+        (i * 0.4 - 1.0, j * 0.4 - 1.0, f(i * 0.4 - 1.0, j * 0.4 - 1.0))
+        for i in range(4)
+        for j in range(4)
+    ]
+    normals = [normal(p[0], p[1]) for p in points]
+    return points, normals
+
+
+def recompute_projection_rmse(pose, source, target, normals, correspondences):
+    moved = pose.transform_points(source)
+    unit = []
+    for normal in normals:
+        length = math.sqrt(sum(c * c for c in normal))
+        unit.append(tuple(c / length for c in normal))
+    total = 0.0
+    for source_index, target_index in correspondences:
+        error = sum(
+            unit[target_index][k] * (moved[source_index][k] - target[target_index][k])
+            for k in range(3)
+        )
+        total += error * error
+    return math.sqrt(total / len(correspondences))
+
+
+class PointToPlaneAlignmentTest(unittest.TestCase):
+    def test_recovers_known_rigid_transform(self):
+        source, normals = bumpy_surface()
+        truth = Pose3((0.15, -0.1, 0.08), (math.cos(0.05), 0.0, 0.0, math.sin(0.05)))
+        target = truth.transform_points(source)
+        result = point_to_plane_icp(source, target, normals)
+        self.assertIsInstance(result, PointToPlaneICPResult)
+        self.assertTrue(result.converged)
+        self.assertGreaterEqual(result.iterations, 1)
+        self.assertAlmostEqual(result.rmse, 0.0, delta=1e-9)
+        pose_close(self, result.pose, truth, tol=1e-8)
+
+    def test_recovers_transform_from_initial_guess(self):
+        source, normals = bumpy_surface()
+        truth = Pose3((0.8, -0.6, 0.4), (0.36, 0.48, 0.6, 0.6))
+        target = truth.transform_points(source)
+        guess = truth.compose(
+            Pose3.exp((0.01, -0.02, 0.015, 0.02, -0.01, 0.01))
+        )
+        result = point_to_plane_icp(source, target, normals, initial_pose=guess)
+        self.assertTrue(result.converged)
+        self.assertAlmostEqual(result.rmse, 0.0, delta=1e-9)
+        pose_close(self, result.pose, truth, tol=1e-8)
+
+    def test_normal_scale_does_not_change_result(self):
+        source, normals = bumpy_surface()
+        truth = Pose3((0.15, -0.1, 0.08), (math.cos(0.05), 0.0, 0.0, math.sin(0.05)))
+        target = truth.transform_points(source)
+        scaled = [(n[0] * 7.5, n[1] * 7.5, n[2] * 7.5) for n in normals]
+        first = point_to_plane_icp(source, target, normals)
+        second = point_to_plane_icp(source, target, scaled)
+        self.assertEqual(first.correspondences, second.correspondences)
+        self.assertEqual(first.iterations, second.iterations)
+        self.assertAlmostEqual(first.rmse, second.rmse, delta=1e-12)
+        pose_close(self, first.pose, second.pose, tol=1e-9)
+
+    def test_deterministic_across_calls(self):
+        source, normals = bumpy_surface()
+        truth = Pose3((0.15, -0.1, 0.08), (math.cos(0.05), 0.0, 0.0, math.sin(0.05)))
+        target = truth.transform_points(source)
+        first = point_to_plane_icp(source, target, normals)
+        second = point_to_plane_icp(
+            tuple(tuple(p) for p in source), target, tuple(normals)
+        )
+        self.assertEqual(first.pose, second.pose)
+        self.assertEqual(first.correspondences, second.correspondences)
+        self.assertEqual(first.iterations, second.iterations)
+        self.assertEqual(first.converged, second.converged)
+        self.assertAlmostEqual(first.rmse, second.rmse, delta=1e-15)
+
+    def test_correspondences_sorted_and_consistent_with_rmse(self):
+        source, normals = bumpy_surface()
+        truth = Pose3((0.15, -0.1, 0.08), (math.cos(0.05), 0.0, 0.0, math.sin(0.05)))
+        target = list(truth.transform_points(source))
+        target.append((5.0, 5.0, 5.0))  # extra decoy target
+        normals = list(normals)
+        normals.append((0.0, 0.0, 1.0))
+        result = point_to_plane_icp(source, target, normals)
+        source_indices = [pair[0] for pair in result.correspondences]
+        self.assertEqual(source_indices, sorted(source_indices))
+        self.assertEqual(len(set(source_indices)), len(source_indices))
+        manual = recompute_projection_rmse(
+            result.pose, source, target, normals, result.correspondences
+        )
+        self.assertAlmostEqual(result.rmse, manual, delta=1e-12)
+
+    def test_exhausting_iterations_returns_false_without_raising(self):
+        source, normals = bumpy_surface()
+        truth = Pose3((0.4, -0.3, 0.2), rotation_z(0.25).quaternion)
+        target = truth.transform_points(source)
+        result = point_to_plane_icp(source, target, normals, max_iterations=2)
+        self.assertFalse(result.converged)
+        self.assertEqual(result.iterations, 2)
+
+    def test_result_is_immutable(self):
+        source, normals = bumpy_surface()
+        result = point_to_plane_icp(source, list(source), normals)
+        with self.assertRaises(AttributeError):
+            result.pose = Pose3()  # type: ignore[misc]
+        with self.assertRaises(AttributeError):
+            result.rmse = 1.0  # type: ignore[misc]
+        self.assertIsInstance(result.correspondences, tuple)
+
+
+class PointToPlaneDegeneracyTest(unittest.TestCase):
+    def test_planar_cloud_with_uniform_normals_raises_value_error(self):
+        plane = [(i * 0.5, j * 0.5, 0.0) for i in range(3) for j in range(3)]
+        normals = [(0.0, 0.0, 1.0)] * 9
+        with self.assertRaises(ValueError):
+            point_to_plane_icp(plane, plane, normals)
+
+    def test_gate_too_strict_raises_value_error(self):
+        source, normals = bumpy_surface()
+        target = [(p[0] + 100.0, p[1], p[2]) for p in source]
+        with self.assertRaises(ValueError):
+            point_to_plane_icp(
+                source, target, normals, max_correspondence_distance=0.1
+            )
+
+
+class PointToPlaneValidationTest(unittest.TestCase):
+    GOOD = [(float(i), float(i % 3), float(i % 2) * 0.5) for i in range(6)]
+    NORMALS = [(0.0, 0.0, 1.0)] * 6
+
+    def test_too_few_points_raise_value_error(self):
+        with self.assertRaises(ValueError):
+            point_to_plane_icp(self.GOOD[:5], self.GOOD, self.NORMALS)
+        with self.assertRaises(ValueError):
+            point_to_plane_icp(self.GOOD, self.GOOD[:5], self.NORMALS[:5])
+        with self.assertRaises(ValueError):
+            point_to_plane_icp([], self.GOOD, self.NORMALS)
+
+    def test_normal_count_mismatch_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            point_to_plane_icp(self.GOOD, self.GOOD, self.NORMALS[:5])
+        with self.assertRaises(ValueError):
+            point_to_plane_icp(self.GOOD, self.GOOD, self.NORMALS * 2)
+
+    def test_zero_length_normal_raises_value_error(self):
+        normals = [(0.0, 0.0, 0.0)] * 6
+        with self.assertRaises(ValueError):
+            point_to_plane_icp(self.GOOD, self.GOOD, normals)
+
+    def test_non_finite_values_raise_value_error(self):
+        for bad in (math.nan, math.inf, -math.inf):
+            with self.assertRaises(ValueError):
+                point_to_plane_icp(
+                    [(bad, 0.0, 0.0)] + self.GOOD[1:], self.GOOD, self.NORMALS
+                )
+            with self.assertRaises(ValueError):
+                point_to_plane_icp(
+                    self.GOOD, self.GOOD, [(0.0, 0.0, bad)] * 6
+                )
+
+    def test_non_iterable_inputs_raise_type_error(self):
+        with self.assertRaises(TypeError):
+            point_to_plane_icp(3, self.GOOD, self.NORMALS)
+        with self.assertRaises(TypeError):
+            point_to_plane_icp(self.GOOD, "abc", self.NORMALS)
+        with self.assertRaises(TypeError):
+            point_to_plane_icp(self.GOOD, self.GOOD, 3)
+
+    def test_wrong_dimensions_and_types_raise_type_error(self):
+        with self.assertRaises(TypeError):
+            point_to_plane_icp([(0.0, 0.0)] * 6, self.GOOD, self.NORMALS)
+        with self.assertRaises(TypeError):
+            point_to_plane_icp(self.GOOD, self.GOOD, [(0.0, 0.0)] * 6)
+        with self.assertRaises(TypeError):
+            point_to_plane_icp(
+                [(True, 0.0, 0.0)] * 6, self.GOOD, self.NORMALS
+            )
+        with self.assertRaises(TypeError):
+            point_to_plane_icp(
+                self.GOOD, self.GOOD, [(0.0, "x", 1.0)] * 6
+            )
+
+    def test_parameter_validation(self):
+        with self.assertRaises(TypeError):
+            point_to_plane_icp(
+                self.GOOD, self.GOOD, self.NORMALS, initial_pose=(0.0, 0.0, 0.0)
+            )
+        for bad in (1.0, True, "5"):
+            with self.assertRaises(TypeError):
+                point_to_plane_icp(
+                    self.GOOD, self.GOOD, self.NORMALS, max_iterations=bad
+                )
+        with self.assertRaises(ValueError):
+            point_to_plane_icp(
+                self.GOOD, self.GOOD, self.NORMALS, max_iterations=0
+            )
+        for bad in (0.0, -1e-6, math.inf, math.nan):
+            with self.assertRaises(ValueError):
+                point_to_plane_icp(
+                    self.GOOD, self.GOOD, self.NORMALS, tolerance=bad
+                )
+        for bad in (0.0, -1.0, math.inf, math.nan):
+            with self.assertRaises(ValueError):
+                point_to_plane_icp(
+                    self.GOOD, self.GOOD, self.NORMALS,
+                    max_correspondence_distance=bad,
+                )
+        for bad in (True, "1.0"):
+            with self.assertRaises(TypeError):
+                point_to_plane_icp(
+                    self.GOOD, self.GOOD, self.NORMALS,
+                    max_correspondence_distance=bad,
+                )
 
 
 if __name__ == "__main__":
