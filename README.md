@@ -150,10 +150,36 @@ grid.data        # 一维元组，按 y 递增、每行 x 递增；-1/0/100 = �
 
 `OccupancyGrid2D` 不可变，格 `(ix, iy)` 的索引为 `iy * width + ix`。输入帧或点的顺序变化不改变相同观测集合的结果；`scans` 及点云生成器只被消费一次且输入不被修改，空 `scans` 或空点云会被拒绝。`scans` 或点云不可迭代、帧形状错误、ID 不是非布尔整数、位姿不是 `Pose3`、点维度错误、坐标或参数不是非布尔实数时抛出 `TypeError`；重复 ID、坐标非有限、空帧或空点云、`resolution` 非正或非有限、`padding` 为负或非有限、`max_range` 非正或非有限时抛出 `ValueError`。该模块仅依赖标准库与 `mappilot.geometry`，导入时不会启动 HTTP 服务。
 
+## 重定位
+
+`mappilot.localization.correlative_scan_match` 在已有粗略先验时把局部三维扫描确定性相关匹配到二维占据栅格，用于重定位与丢失恢复。候选位姿在以初值为中心的三轴格点上穷举：每个偏移是对应步长的整数倍且绝对值不超过对应窗口，零始终包含在内；候选把 `dx`、`dy` 直接加到初值世界平移（z 不变），并在初始旋转左侧复合绕世界 z 轴的 `dyaw`。每个候选按 `Pose3` 语义变换扫描点，再按 `floor((p - origin) / resolution)` 投影到栅格（z 不参与评分）：占据格记 +1，空闲格记 -1，未知格与地图外点不计入已知点数；已知点数达到 `min_known_points` 的候选以这些值的平均数为得分。
+
+```python
+from mappilot.localization import correlative_scan_match
+
+result = correlative_scan_match(
+    grid,               # OccupancyGrid2D
+    scan_points,        # 局部坐标系三维点，至少一个
+    initial_pose,       # Pose3 初值
+    x_window=0.5, x_step=0.05,        # 非负有限窗口，正有限步长
+    y_window=0.5, y_step=0.05,
+    yaw_window=0.5, yaw_step=0.05,
+    min_known_points=10,              # 非布尔整数，至少为 1
+    min_score=0.5,                    # [-1, 1] 内的有限实数
+)
+result.pose                 # 最佳候选位姿（无合格候选时为原初值）
+result.matched              # 最佳得分达到 min_score 才为 True
+result.score                # 最佳得分；无合格候选时为 None
+result.known_points         # 最佳候选的已知点数；无合格候选时为 0
+result.evaluated_candidates # 实际搜索的候选总数
+```
+
+`CorrelativeScanMatchResult` 不可变。同分时依次选择已知点更多、`dx²+dy²+dyaw²` 更小、`dx`、`dy`、`dyaw` 升序者，因此相同输入逐值一致。最佳得分低于阈值时仍返回该位姿与得分（`matched=False`）；没有任何候选达到最低已知点数时返回原初值、`matched=False`、`score=None`、`known_points=0`，`evaluated_candidates` 始终是实际搜索的候选总数。扫描不可迭代、点维度错误、坐标或实数参数类型错误、最低已知点数不是非布尔整数、地图或初值类型错误时抛出 `TypeError`；扫描为空、坐标非有限、窗口为负或非有限、步长非正或非有限、最低已知点数小于一、最低得分不在 `[-1, 1]` 时抛出 `ValueError`。生成器只被消费一次，输入不被修改。该模块仅依赖标准库与 `mappilot.geometry`、`mappilot.mapping`，导入时不会启动 HTTP 服务。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-多传感器融合、重定位等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
+多传感器融合等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
