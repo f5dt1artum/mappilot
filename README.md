@@ -20,10 +20,34 @@ PYTHONPATH=src python3 -m mappilot.server --host 127.0.0.1 --port 8080
 PYTHONPATH=src python3 -c "from mappilot.geometry import Pose3; print(Pose3.exp((0, 0, 1, 1, 2, 3)).log())"
 ```
 
+## 扫描匹配
+
+`mappilot.registration.point_to_point_icp` 用点到点 ICP 估计把源点云对齐到目标点云的 `Pose3`。每轮先用当前位姿变换源点，再为每个源点选择最近目标点（目标点可被重复选择，等距时取索引最小者），可选地丢弃距离超过 `max_correspondence_distance` 的配对，最后以 Horn 闭式单位四元数解更新使平方距离和最小的刚体位姿（旋转行列式恒为 +1，不含镜像）。相邻两轮 RMSE 绝对差不超过 `tolerance` 时收敛；用尽 `max_iterations` 则返回最后结果且 `converged` 为 `False`，不抛出异常。
+
+```python
+from mappilot.registration import point_to_point_icp
+
+result = point_to_point_icp(
+    source_points,          # 至少三个三维点
+    target_points,          # 至少三个三维点
+    initial_pose=None,      # 默认单位位姿
+    max_iterations=50,      # 正整数
+    tolerance=1e-6,         # 有限正数
+    max_correspondence_distance=None,  # 给出时须为有限正数
+)
+result.pose            # 估计的 Pose3
+result.converged       # 是否在预算内收敛
+result.iterations      # 实际完成的位姿更新次数
+result.rmse            # 最终配对的欧氏距离均方根（按最终位姿重算）
+result.correspondences # (源点索引, 目标点索引)，按源点索引升序
+```
+
+返回的 `ICPResult` 为不可变命名元组。非可迭代点云、点维度错误、坐标非实数或为布尔值、`initial_pose` 不是 `Pose3`、参数类型错误抛出 `TypeError`；坐标含 NaN/无穷、点数不足、距离门限后有效配对少于三个、配对共线等无法唯一约束三维刚体位姿，或数值参数范围不合法时抛出 `ValueError`。该模块仅依赖标准库，导入时不启动 HTTP 服务。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-扫描匹配与位姿图优化等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
+位姿图优化、闭环检测等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
