@@ -203,6 +203,35 @@ points = deskew_point_cloud(
 
 返回不可变三维点元组组成的元组，顺序与数量和输入完全一致；静止轨迹下逐值保留点。所有点时刻及 `reference_time` 必须落在轨迹时间戳闭区间内；需要跨越的相邻样本间隔超过 `max_interpolation_gap` 时抛出 `ValueError`，恰好命中样本不受此限制。输入生成器只被消费一次，调用方对象不被修改。不可迭代输入、记录形状或点维度错误、时间与坐标不是非布尔实数、轨迹位姿或外参不是 `Pose3` 时抛出 `TypeError`；空点云、轨迹样本少于两条、时间戳重复或逆序、任一数值非有限、`max_interpolation_gap` 非正时抛出 `ValueError`。该模块仅依赖标准库与 `mappilot.geometry`，纯 Python 实现，导入时不会启动 HTTP 服务。
 
+`mappilot.inertial.preintegrate_imu` 把一段按时间排列的 IMU 样本压缩为可供视觉或激光后端复用的单个相对运动增量。每个样本为 `(timestamp, acceleration, angular_velocity)`：`timestamp` 为绝对秒时间戳，后两项是采样时刻机体系中的三轴比力与三轴角速度。时间戳必须严格递增且至少两条；偏置在全段恒定，区间 `[t[k], t[k+1]]` 采用左端样本的偏置校正测量。
+
+积分从单位旋转、零速度、零位置开始。对每个区间长度 `dt`，先用区间开始处的增量旋转把校正比力转到起始机体系，再按
+
+```
+Δp' = Δp + Δv·dt + 0.5·a·dt²
+Δv' = Δv + a·dt
+ΔR' = ΔR · Pose3.exp((ωx·dt, ωy·dt, ωz·dt, 0, 0, 0))
+```
+
+更新（先位置、速度，再右复合旋转增量）。
+
+```python
+from mappilot.inertial import preintegrate_imu
+
+result = preintegrate_imu(
+    samples,                          # (绝对秒时间戳, 三轴比力, 三轴角速度)，严格递增，至少两条
+    accelerometer_bias=(0, 0, 0),     # 三轴加速度计偏置，缺省为零
+    gyroscope_bias=(0, 0, 0),         # 三轴陀螺偏置，缺省为零
+    max_interval=None,                # None 不限制间隔，或正有限实数
+)
+result.delta_pose       # 平移为 Δp、旋转为累计 ΔR 的 Pose3
+result.delta_velocity   # 起始机体系中的速度增量
+result.duration         # 末首时间戳之差
+result.intervals        # 样本数减一
+```
+
+`PreintegratedImu` 与其所有字段均不可变；零测量产生单位 `delta_pose` 与零速度，不均匀采样按相同规则逐区间处理。相邻间隔严格大于 `max_interval` 时抛出 `ValueError`，恰好等于限制被接受。样本生成器只被消费一次，输入不被修改，相同输入逐值一致。样本或向量不可迭代、记录或向量维度错误、测量值与偏置不是非布尔实数、`max_interval` 既非 `None` 也非实数时抛出 `TypeError`；样本不足两条、任一数值非有限、时间戳重复或逆序、`max_interval` 非正或非有限，或有限输入在累计中产生非有限结果时抛出 `ValueError`，且不返回部分结果。该模块仅依赖标准库与 `mappilot.geometry`，纯 Python 实现，沿用 Pose3 的右手坐标系约定，导入时不会启动 HTTP 服务。
+
 ## 验证
 
 ```bash
