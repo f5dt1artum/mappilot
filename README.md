@@ -178,6 +178,31 @@ result.evaluated_candidates # 实际搜索的候选总数
 
 `CorrelativeScanMatchResult` 不可变。最佳候选低于阈值时仍返回该位姿与得分（`matched=False`）；没有候选达到 `min_known_points` 时返回原初值、`matched=False`、`score=None`、`known_points=0`。扫描生成器只被消费一次，输入不被修改，相同输入逐值一致。扫描不可迭代、点维度错误、坐标或实数参数类型错误、`min_known_points` 不是非布尔整数、地图或初值类型错误时抛出 `TypeError`；扫描为空、坐标非有限、窗口为负或非有限、步长非正或非有限、`min_known_points` 小于一、`min_score` 不在 `[-1, 1]` 时抛出 `ValueError`。该模块仅依赖标准库与 `mappilot.geometry`、`mappilot.mapping`，导入时不会启动 HTTP 服务。
 
+## 运动畸变补偿
+
+`mappilot.motion_compensation.deskew_point_cloud` 把一帧扫描期间机体连续运动造成的点云畸变统一补偿到指定参考时刻。扫描点按原顺序给出，每条记录为相对 `scan_time` 的秒偏移与一个传感器系三维点；轨迹为严格递增的绝对秒时间戳与机体系到世界系 `Pose3` 样本；`sensor_to_body` 是传感器系到机体系的 `Pose3`；`reference_time` 缺省等于 `scan_time`。
+
+每个点按其绝对时刻 `scan_time + offset` 在两侧轨迹样本之间插值机体位姿：平移逐分量线性插值，旋转沿单位四元数最短弧插值；恰好命中样本时直接使用该 `Pose3`。点先经采样时刻的 `sensor_to_body` 与机体世界位姿变到世界系，再经参考时刻传感器世界位姿的逆变换拉回参考时刻传感器系：
+
+```
+p_ref = T_sensor_world(reference_time)^{-1} · T_body_world(t) · T_sensor_body · p
+```
+
+```python
+from mappilot.motion_compensation import deskew_point_cloud
+
+points = deskew_point_cloud(
+    scan_points,             # (相对 scan_time 的秒偏移, 三维点) 按原顺序排列
+    scan_time,               # 扫描原点绝对时间戳（秒）
+    trajectory,              # (绝对秒时间戳, 机体到世界 Pose3)，严格递增，至少两条
+    sensor_to_body,          # 传感器系到机体系 Pose3
+    reference_time=None,     # None 时等于 scan_time
+    max_interpolation_gap=None,  # None 或正有限实数
+)
+```
+
+返回不可变三维点元组组成的元组，顺序与数量和输入完全一致；静止轨迹下逐值保留点。所有点时刻及 `reference_time` 必须落在轨迹时间戳闭区间内；需要跨越的相邻样本间隔超过 `max_interpolation_gap` 时抛出 `ValueError`，恰好命中样本不受此限制。输入生成器只被消费一次，调用方对象不被修改。不可迭代输入、记录形状或点维度错误、时间与坐标不是非布尔实数、轨迹位姿或外参不是 `Pose3` 时抛出 `TypeError`；空点云、轨迹样本少于两条、时间戳重复或逆序、任一数值非有限、`max_interpolation_gap` 非正时抛出 `ValueError`。该模块仅依赖标准库与 `mappilot.geometry`，纯 Python 实现，导入时不会启动 HTTP 服务。
+
 ## 验证
 
 ```bash
