@@ -232,10 +232,48 @@ result.intervals        # 样本数减一
 
 `PreintegratedImu` 与其所有字段均不可变；零测量产生单位 `delta_pose` 与零速度，不均匀采样按相同规则逐区间处理。相邻间隔严格大于 `max_interval` 时抛出 `ValueError`，恰好等于限制被接受。样本生成器只被消费一次，输入不被修改，相同输入逐值一致。样本或向量不可迭代、记录或向量维度错误、测量值与偏置不是非布尔实数、`max_interval` 既非 `None` 也非实数时抛出 `TypeError`；样本不足两条、任一数值非有限、时间戳重复或逆序、`max_interval` 非正或非有限，或有限输入在累计中产生非有限结果时抛出 `ValueError`，且不返回部分结果。该模块仅依赖标准库与 `mappilot.geometry`，纯 Python 实现，沿用 Pose3 的右手坐标系约定，导入时不会启动 HTTP 服务。
 
+## 惯导预测与位姿观测融合
+
+`mappilot.fusion.fuse_imu_pose` 在严格递增的 IMU 时间线上做恒定偏置的左端捷联递推，并在携带外部位姿观测的 IMU 时刻把增益缩放后的 SE(3) 校正右复合到预测位姿，每个 IMU 样本输出一个不可变 `FusionState`。IMU 记录沿用 `preintegrate_imu` 的 `(timestamp, acceleration, angular_velocity)` 语义，至少两条且时间戳严格递增；位姿观测为按时间严格递增的 `(timestamp, pose)` 序列，`pose` 是观测到的机体系到世界系 `Pose3`，时间戳必须精确命中某个 IMU 样本、同一时刻不得重复，观测序列允许为空。
+
+相邻 IMU 时刻 `t[k]` 到 `t[k+1]` 之间使用左端样本 `k` 的偏置校正测量保持恒定：
+
+```
+R_new  = R · Exp((ω-b_g)·dt)
+a_w    = R·(a-b_a) + gravity
+p_new  = p + v·dt + 0.5·a_w·dt²
+v_new  = v + a_w·dt
+```
+
+到达观测时刻后计算残差 `error = T_pred.inverse().compose(T_obs)`：当给定 `residual_threshold` 时，用 `error` 的平移范数与 `Pose3.log(error)` 旋转前三维的范数判定门限，任一值严格超过门限即保留预测状态并把 `observation_used` 标为 `False`（等于门限仍采用）。采用时以 `translation_gain`、`rotation_gain` 分别缩放 `log(error)` 的平移、旋转分量，把 `Pose3.exp` 得到的增量右复合到预测位姿，速度不直接改变。首个 IMU 时刻的观测以完全相同的规则校正初始状态；所有输出均为校正后的状态。
+
+```python
+from mappilot.fusion import fuse_imu_pose
+
+states = fuse_imu_pose(
+    imu_samples,                    # (绝对秒时间戳, 三轴比力, 三轴角速度)，严格递增，至少两条
+    pose_observations,              # (绝对秒时间戳, 机体系到世界系 Pose3)，严格递增，可为空
+    initial_pose,                   # 首个 IMU 时刻的机体系到世界系 Pose3
+    initial_velocity,               # 首个 IMU 时刻的世界系速度三维向量
+    accelerometer_bias=(0, 0, 0),   # 三轴加速度计偏置
+    gyroscope_bias=(0, 0, 0),       # 三轴陀螺偏置
+    gravity=(0, 0, 0),              # 世界系重力三维向量
+    translation_gain=1.0,           # 平移校正增益，取值 [0, 1]
+    rotation_gain=1.0,              # 旋转校正增益，取值 [0, 1]
+    residual_threshold=None,        # None 不设门限，否则为非负有限实数
+)
+state.timestamp            # IMU 时间戳
+state.pose                 # 校正后的机体系到世界系 Pose3
+state.velocity             # 世界系速度（观测不直接改变速度）
+state.observation_used     # 无观测 None；采用 True；门限拒绝 False
+```
+
+返回不可变 `FusionState` 元组，长度与 IMU 样本数一致、顺序一致。两个输入生成器只被消费一次，调用方对象不被修改，相同输入逐值一致。记录不可迭代、形状或维度错误、数值不是非布尔实数、初始位姿或观测位姿不是 `Pose3`、增益或门限类型错误时抛出 `TypeError`；IMU 少于两条、数值非有限、任一时间序列不严格递增、观测时间未命中 IMU 样本、增益不在 `[0, 1]`、门限为负或非有限、传播产生非有限状态时抛出 `ValueError`，且不返回部分结果。该模块仅依赖标准库与 `mappilot.geometry`，纯 Python 实现，导入时不会启动 HTTP 服务。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-多传感器融合等能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
+其他多传感器融合能力尚未实现，留待后续任务从已冻结事实出发独立设计并验证。
