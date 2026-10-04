@@ -270,6 +270,37 @@ state.observation_used     # 无观测 None；采用 True；门限拒绝 False
 
 返回不可变 `FusionState` 元组，长度与 IMU 样本数一致、顺序一致。两个输入生成器只被消费一次，调用方对象不被修改，相同输入逐值一致。记录不可迭代、形状或维度错误、数值不是非布尔实数、初始位姿或观测位姿不是 `Pose3`、增益或门限类型错误时抛出 `TypeError`；IMU 少于两条、数值非有限、任一时间序列不严格递增、观测时间未命中 IMU 样本、增益不在 `[0, 1]`、门限为负或非有限、传播产生非有限状态时抛出 `ValueError`，且不返回部分结果。该模块仅依赖标准库与 `mappilot.geometry`，纯 Python 实现，导入时不会启动 HTTP 服务。
 
+## 外参标定
+
+`mappilot.calibration.calibrate_extrinsic` 根据同一时间区间内机体系与传感器各自测得的成对相对运动，估计传感器系到机体系的外参 `Pose3`。残差只含相对运动，因此两条轨迹无需共享世界原点。每条观测为 `(body_motion, sensor_motion, weight)`，两个运动均为 `Pose3`，权重为正有限实数；外参记为 `X`，单条残差为
+
+```
+e = log((body_motion.compose(X)).inverse().compose(X.compose(sensor_motion)))
+```
+
+目标为各残差六维平方范数的加权和 `Σ w·‖e‖²`，在 `Pose3.exp`/`Pose3.log` 的左扰动约定（`X ← exp(dx)·X`）下做高斯-牛顿迭代；当纯高斯-牛顿步奇异或不能使目标下降时加入列文伯格阻尼，直到取得有限且不增大的一步。
+
+```python
+from mappilot.calibration import calibrate_extrinsic
+
+result = calibrate_extrinsic(
+    observations,               # (body_motion, sensor_motion, weight)，至少三条
+    initial_pose=None,          # 外参初值，None 表示单位位姿
+    max_iterations=50,          # 正整数
+    tolerance=1e-6,             # 正有限实数
+)
+result.sensor_to_body     # 估计的传感器系到机体系 Pose3
+result.converged          # 是否在迭代上限内收敛
+result.iterations         # 实际完成的更新次数
+result.initial_error      # 初值处的加权目标值
+result.final_error        # 最终位姿处的加权目标值
+result.residuals          # 与输入同序的六维残差元组
+```
+
+`ExtrinsicCalibrationResult` 不可变；`initial_error`、`final_error` 与 `residuals` 均可由对应位姿重新计算并始终一致。初始目标值不大于 `tolerance` 时直接成功且 `iterations` 为零、位姿保持初值不变；否则相邻两次更新的目标值之差的绝对值不大于 `tolerance` 即收敛。用尽 `max_iterations` 不抛异常，返回最后结果且 `converged=False`。观测生成器只被消费一次，调用方对象不被修改，相同输入逐值一致。
+
+观测不可迭代、记录形状错误、运动或 `initial_pose` 不是 `Pose3`、权重或控制参数类型错误（含布尔值）时抛出 `TypeError`；观测少于三条、权重非正或非有限、`max_iterations` 不是正整数、`tolerance` 非正或非有限、计算产生非有限值，或运动集合不能唯一约束六自由度外参时抛出 `ValueError`，且不返回部分结果。全部运动为单位位姿、有效旋转全为零或仅有单一转轴（平移不能补足缺失轴）均判为退化；重复但整体仍可观测的运动不属于格式错误。该模块仅依赖标准库与 `mappilot.geometry`，纯 Python 实现，导入时不会启动 HTTP 服务。
+
 ## 验证
 
 ```bash
